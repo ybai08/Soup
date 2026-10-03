@@ -298,6 +298,28 @@ class _RangeReaders:
             thread.join(timeout=max(0.0, deadline - time.monotonic()))
 
 
+def _allocate_pinned_arena(size: int) -> Any:
+    """``size`` bytes of page-locked CPU memory, or an error that says why not."""
+    import torch
+
+    arena = torch.empty(size, dtype=torch.uint8, device="cpu", pin_memory=True)
+    if arena.device.type != "cpu":
+        raise RuntimeError(
+            "layer streaming's async disk source requested a CPU "
+            f"tensor, but torch returned {arena.device}."
+        )
+    # Mirrors RamSource: a box that hands back pageable memory
+    # would otherwise report pinned=True while silently paying
+    # the ~97% -> ~79% GPU-utilisation cost of a synchronous
+    # host-to-device copy.
+    if not arena.is_pinned():
+        raise RuntimeError(
+            "layer streaming requested pinned CPU RAM, but torch "
+            "returned pageable memory; retry with pin=False."
+        )
+    return arena
+
+
 class AsyncDiskSource:
     """Read layers ahead on a background thread; ``get`` hands over the result.
 
@@ -519,7 +541,7 @@ class AsyncDiskSource:
         # and said out loud: the two paths differ 2.4x cold (#974).
         self.direct_io = False
         aligned = all(region.data_ptr() % SECTOR_BYTES == 0 for region in self._regions)
-        if not aligned:  # pragma: no cover — cudaHostAlloc hands out page-aligned blocks
+        if not aligned:  # _allocate_staging aligns every arena; kept as the safe fallback
             logger.warning(
                 "layer streaming's staging is not sector-aligned on this box; the "
                 "disk tier reads through the page cache instead of direct I/O"
@@ -607,26 +629,26 @@ class AsyncDiskSource:
         regions: List[Any] = []
         if self.pinned:
             plan = plan_pinned_arenas(region_sizes, align=SECTOR_BYTES)
-            for size in plan.arena_sizes:
-                arena = torch.empty(size, dtype=torch.uint8, device="cpu", pin_memory=True)
-                if arena.device.type != "cpu":
-                    raise RuntimeError(
-                        "layer streaming's async disk source requested a CPU "
-                        f"tensor, but torch returned {arena.device}."
-                    )
-                # Mirrors RamSource: a box that hands back pageable memory
-                # would otherwise report pinned=True while silently paying
-                # the ~97% -> ~79% GPU-utilisation cost of a synchronous
-                # host-to-device copy.
-                if not arena.is_pinned():
-                    raise RuntimeError(
-                        "layer streaming requested pinned CPU RAM, but torch "
-                        "returned pageable memory; retry with pin=False."
-                    )
-                arenas.append(arena)
+            fills = [0] * len(plan.arena_sizes)
             for (arena_index, offset), size in zip(plan.placements, region_sizes):
-                regions.append(arenas[arena_index][offset : offset + size])
-            self.pinned_bytes = plan.pinned_bytes
+                fills[arena_index] = max(fills[arena_index], offset + size)
+            # The placements are sector-aligned within their arena, but the caching
+            # host allocator can hand back a base at a multiple of only 512 bytes.
+            shifts: List[int] = []
+            for size, fill in zip(plan.arena_sizes, fills):
+                arena = _allocate_pinned_arena(size)
+                shift = (-arena.data_ptr()) % SECTOR_BYTES
+                if shift + fill > size:
+                    # No room to shift: the next power of two has at least a sector spare.
+                    del arena
+                    arena = _allocate_pinned_arena(2 * size)
+                    shift = (-arena.data_ptr()) % SECTOR_BYTES
+                arenas.append(arena)
+                shifts.append(shift)
+            for (arena_index, offset), size in zip(plan.placements, region_sizes):
+                start = shifts[arena_index] + offset
+                regions.append(arenas[arena_index][start : start + size])
+            self.pinned_bytes = sum(arena.numel() for arena in arenas)
         else:
             # The CPU allocator neither rounds nor aligns: a sector of slack
             # per region buys the alignment direct I/O needs.
